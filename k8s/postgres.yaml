@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+stringData:
+  POSTGRES_USER: agent_relay
+  POSTGRES_PASSWORD: agent_relay
+  POSTGRES_DB: agent_relay
+  DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@postgres:5432/agent_relay
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+spec:
+  # Headless (no cluster IP): a StatefulSet needs this so each pod gets a
+  # stable DNS name, and it's also what "postgres" resolves to for the
+  # DATABASE_URL above.
+  clusterIP: None
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "agent_relay", "-d", "agent_relay"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "agent_relay", "-d", "agent_relay"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+  # volumeClaimTemplates (not a plain "volumes" entry) is what gives Postgres
+  # persistent storage: Kubernetes provisions one real PersistentVolume per
+  # replica and keeps rebinding the same one across pod restarts/reschedules,
+  # instead of the pod's disk resetting empty each time like a container's
+  # own filesystem would.
+  volumeClaimTemplates:
+    - metadata:
+        name: postgres-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

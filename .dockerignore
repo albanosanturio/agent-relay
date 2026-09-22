@@ -1,0 +1,8 @@
+.venv
+.git
+.ruff_cache
+__pycache__
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json

@@ -1,9 +1,10 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models, for SQLite or PostgreSQL.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is the only place that knows which backend is in use: SQLite
+connection pragmas and its whole-database writer lock, or PostgreSQL's normal
+transactions plus the ``ROW_LOCKING`` flag storage.py uses to take row-level
+``FOR UPDATE`` locks instead.  The rest of the application talks to the models
+through :mod:`storage` and never branches on the backend itself.
 """
 
 from __future__ import annotations
@@ -134,6 +135,12 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+# SQLite serializes every writer with a whole-database BEGIN IMMEDIATE lock
+# (see immediate_transaction below), so no row ever needs its own lock.
+# PostgreSQL instead relies on row-level SELECT ... FOR UPDATE at the specific
+# rows storage.py mutates, which lets unrelated tasks be claimed concurrently.
+ROW_LOCKING = not _is_sqlite(DATABASE_URL)
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -177,19 +184,21 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    On SQLite this opens with ``BEGIN IMMEDIATE``, a whole-database writer
+    reservation that serializes claims, heartbeats, and terminal submissions
+    across API processes (SQLite has no ``SELECT ... FOR UPDATE``). On
+    PostgreSQL this is a normal transaction; storage.py takes row-level
+    ``FOR UPDATE`` locks on only the rows being mutated, so unrelated tasks
+    can be claimed at the same time instead of the whole database serializing.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -205,16 +214,17 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    query = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if ROW_LOCKING:
+        query = query.with_for_update(skip_locked=True)
+    expired = list(db.scalars(query))
     count = 0
     for attempt in expired:
-        task = db.get(Task, attempt.task_id)
+        task = db.get(Task, attempt.task_id, with_for_update=ROW_LOCKING)
         if task is None or attempt.outcome != "processing":
             continue
         attempt.outcome = "expired"
@@ -250,6 +260,7 @@ __all__ = [
     "MAX_BODY_BYTES",
     "MAX_PAGE_SIZE",
     "RECOVERY_INTERVAL_SECONDS",
+    "ROW_LOCKING",
     "Task",
     "as_db_time",
     "db_session",
